@@ -18,18 +18,30 @@
 #define I2S_BCK_PIN      26   // BCLK
 #define I2S_WS_PIN       25   // LRCLK/WS
 #define I2S_SD_IN_PIN    32   // INMP441 SD -> ESP32
-// ---------------------------------------------
+#define BUTTON_PIN       22   // Push button
+
 
 // -------- AUDIO SETTINGS --------
 #define SAMPLE_RATE      16000
 #define BLOCK_SAMPLES    160     // 10 ms @ 16 kHz
 // μ-law gives 1 byte per sample => 160 bytes payload per block
-// --------------------------------
 
 // -------- ESP-NOW / WIFI --------
 #define WIFI_CHANNEL     6
 static uint8_t BCAST_ADDR[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-// --------------------------------
+
+volatile bool buttonFlag = false;
+unsigned long lastISRTime = 0;
+const unsigned long debounceDelay = 200;
+
+void IRAM_ATTR onButtonPress() {
+  unsigned long now = millis();
+  if (now - lastISRTime > debounceDelay) {
+    buttonFlag = !buttonFlag; //will turn on on rising edge and off on falling edge
+    lastISRTime = now;
+  }
+}
+
 
 // ===== μ-law encode/decode =====
 static inline uint8_t linear2ulaw(int16_t pcm) {
@@ -125,6 +137,9 @@ void setup() {
   delay(200);
   Serial.println("ESP-NOW Audio TX @ 16kHz, mu-law");
 
+  pinMode(BUTTON_PIN, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, CHANGE); //want to catch both rising and falling edge of the button
+
   WiFi.mode(WIFI_STA);
   setChannel(WIFI_CHANNEL);
   if (esp_now_init() != ESP_OK) {
@@ -143,25 +158,27 @@ void setup() {
 }
 
 void loop() {
-  // Read 32-bit samples from I2S mic, convert to 16-bit, μ-law encode
-  const int SAMPLES = BLOCK_SAMPLES;
-  int32_t in32[SAMPLES];
-  size_t bytesRead = 0;
-  int frames = i2s_read(I2S_PORT, (void*)in32, SAMPLES * sizeof(int32_t), &bytesRead, portMAX_DELAY) == ESP_OK
-               ? (bytesRead / sizeof(int32_t)) : 0;
-  if (frames <= 0) return;
+  if(buttonFlag){
+    // Read 32-bit samples from I2S mic, convert to 16-bit, μ-law encode
+    const int SAMPLES = BLOCK_SAMPLES;
+    int32_t in32[SAMPLES];
+    size_t bytesRead = 0;
+    int frames = i2s_read(I2S_PORT, (void*)in32, SAMPLES * sizeof(int32_t), &bytesRead, portMAX_DELAY) == ESP_OK
+                ? (bytesRead / sizeof(int32_t)) : 0;
+    if (frames <= 0) return;
 
-  audio_pkt_t pkt{};
-  pkt.seq = seq_no++;
-  pkt.sr = SAMPLE_RATE / 100;
-  pkt.n  = frames;
+    audio_pkt_t pkt{};
+    pkt.seq = seq_no++;
+    pkt.sr = SAMPLE_RATE / 100;
+    pkt.n  = frames;
 
-  for (int i=0; i<frames && i<BLOCK_SAMPLES; ++i) {
-    // INMP441 outputs 24-bit in 32-bit word, typically MSB-aligned
-    int32_t s = in32[i] >> 8;      // reduce to ~24->16 bits
-    if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
-    pkt.data[i] = linear2ulaw((int16_t)s);
+    for (int i=0; i<frames && i<BLOCK_SAMPLES; ++i) {
+      // INMP441 outputs 24-bit in 32-bit word, typically MSB-aligned
+      int32_t s = in32[i] >> 8;      // reduce to ~24->16 bits
+      if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+      pkt.data[i] = linear2ulaw((int16_t)s);
+    }
+
+    esp_now_send(BCAST_ADDR, (uint8_t*)&pkt, sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t)+pkt.n);
   }
-
-  esp_now_send(BCAST_ADDR, (uint8_t*)&pkt, sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t)+pkt.n);
 }
