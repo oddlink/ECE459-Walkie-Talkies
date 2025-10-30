@@ -18,7 +18,7 @@
 #define I2S_BCK_PIN      26   // BCLK
 #define I2S_WS_PIN       25   // LRCLK/WS
 #define I2S_SD_IN_PIN    32   // INMP441 SD -> ESP32
-#define BUTTON_PIN       22   // Push button
+#define BUTTON_PIN       21   // Push button
 
 
 // -------- AUDIO SETTINGS --------
