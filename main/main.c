@@ -1,155 +1,305 @@
-// #include "freertos/FreeRTOS.h"
-// #include "freertos/task.h"
-// #include "esp_system.h"
-// #include "esp_log.h"
-// #include "driver/adc.h"
-// #include "driver/dac.h"
-// #include "driver/gpio.h"
-// #include "esp_timer.h"
+/*
+  ESP32 Walkie-Talkie (Transmitter)
+  - Captures mono audio from I2S mic (e.g., INMP441)
+  - μ-law encodes to 8-bit @ 16 kHz
+  - Sends blocks over ESP-NOW broadcast
+*/
 
-// static const char *TAG = "ECE459";
-// #define LED GPIO_NUM_2
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
+#include "driver/i2s.h"
 
-// // ADC and DAC configuration
-// // ADC1_CHANNEL_6 == GPIO34
-// #define ADC_CHANNEL ADC1_CHANNEL_6
-// // Using DAC_CHANNEL_1 = GPIO22
-// #define OUT_DAC_CHANNEL DAC_CHANNEL_1
 
-// // Desired sample rate (Hz). 8000 is a good simple starting point.
-// #define SAMPLE_RATE 8000
 
-// void app_main(void)
-// {
-//     // --- ADC setup (12-bit) ---
-//     adc1_config_width(ADC_WIDTH_BIT_12);
-//     adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_11); // allow ~0-3.3V
+#define BUTTON_PIN       21   // Push button
 
-//     // --- DAC setup ---
-//     dac_output_enable(OUT_DAC_CHANNEL); // enable DAC on GPIO
+// keep mic pins (your existing)
+// I2S0 (mic)
+#define I2S_MIC_PORT     I2S_NUM_0
+#define I2S_MIC_BCK_PIN  26   // BCLK (mic)
+#define I2S_MIC_WS_PIN   25   // LRCLK/WS (mic)
+#define I2S_SD_IN_PIN    32   // SD (mic -> ESP32)
 
-//     // --- LED setup ---
-//     gpio_config_t io_conf = {
-//         .intr_type = GPIO_INTR_DISABLE,
-//         .mode = GPIO_MODE_OUTPUT,
-//         .pin_bit_mask = (1ULL << LED),
-//         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-//         .pull_up_en = GPIO_PULLUP_DISABLE
-//     };
-//     gpio_config(&io_conf);
-//     int led_state = 1;
-//     gpio_set_level(LED, led_state);
+// new DAC pins for I2S1 (TX)
+#define I2S_DAC_PORT     I2S_NUM_1
+#define I2S_DAC_BCK_PIN  26   // BCLK (DAC)
+#define I2S_DAC_WS_PIN   25   // LRCLK/WS (DAC)
+#define I2S_SD_OUT_PIN   22   // DOUT (ESP32 -> DAC)
 
-//     // Timing variables
-//     const int64_t period_us = 1000000LL / SAMPLE_RATE;
-//     int64_t last_time = esp_timer_get_time();
 
-//     while (1) {
-//         // Read ADC (12-bit: 0..4095)
-//         int raw = adc1_get_raw(ADC_CHANNEL);
 
-//         // Map 12-bit ADC value to 8-bit DAC value (0..255)
-//         // Simple linear mapping:
-//         int dac_val = (raw * 255) / 4095;
-//         if (dac_val < 0) dac_val = 0;
-//         if (dac_val > 255) dac_val = 255;
+// -------- AUDIO SETTINGS --------
+#define SAMPLE_RATE      16000
+#define BLOCK_SAMPLES    160     // 10 ms @ 16 kHz
+// μ-law gives 1 byte per sample => 160 bytes payload per block
 
-//         // Output to DAC
-//         dac_output_voltage(OUT_DAC_CHANNEL, (uint8_t)dac_val);
+// -------- ESP-NOW / WIFI --------
+#define WIFI_CHANNEL     6
+static uint8_t BCAST_ADDR[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-//         // Optional debug print (reduce frequency in real use for performance)
-//         static int print_counter = 0;
-//         if (++print_counter >=  (SAMPLE_RATE / 10)) { // ~10 prints/sec
-//             float voltage = ((float)raw / 4095.0f) * 3.3f;
-//             ESP_LOGI(TAG, "ADC raw=%d  V=%.3fV  DAC=%d", raw, voltage, dac_val);
-//             print_counter = 0;
-//         }
+volatile bool buttonFlag = false;
+volatile bool buttonDisabled = false;
+unsigned long lastISRTime = 0;
+const unsigned long debounceDelay = 200;
 
-//         // LED control based on voltage threshold (kept from your original)
-//         float voltage = ((float)raw/4095)* 3.3;
-//         if (led_state != 1 && voltage > 1.70) {
-//             led_state = 1;
-//             gpio_set_level(LED, led_state);
-//         } else if (led_state != 0 && voltage < 1.55) {
-//             led_state = 0;
-//             gpio_set_level(LED, led_state);
-//         }
+void IRAM_ATTR onButtonPress() {
+  unsigned long now = (unsigned long) (esp_timer_get_time() / 1000);
+  if (now - lastISRTime > debounceDelay) {
+    buttonFlag = !buttonFlag; //will turn on on rising edge and off on falling edge
+    lastISRTime = now;
+  }
+}
 
-//         // Precise sleep to hit SAMPLE_RATE using esp_timer_get_time
-//         int64_t now = esp_timer_get_time();
-//         int64_t elapsed = now - last_time;
-//         int64_t to_wait = period_us - elapsed;
-//         if (to_wait > 0) {
-//             // For short waits use vTaskDelay or busy wait depending on duration.
-//             // If to_wait > 2000 us, yield with vTaskDelay; else busy wait.
-//             if (to_wait > 2000) {
-//                 // convert micros to ticks (coarse) to yield CPU
-//                 vTaskDelay(pdMS_TO_TICKS((to_wait + 500) / 1000));
-//             } else {
-//                 // small busy-wait
-//                 esp_rom_delay_us(to_wait);
-//             }
-//         }
-//         last_time = esp_timer_get_time();
-//     }
-// }
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_system.h"
-#include "esp_log.h"
-#include "driver/adc.h"
+// ===== μ-law encode =====
+static inline uint8_t linear2ulaw(int16_t pcm) {
+  const uint16_t BIAS = 0x84; // 132
+  const uint16_t CLIP = 32635;
+  uint16_t mag;
+  uint8_t sign;
+  uint8_t exponent;
+  uint8_t mantissa;
+  uint8_t ulawbyte;
 
-static const char *TAG = "ECE459";
-#define LED GPIO_NUM_2
-#define DAC GPIO_NUM_22
+  sign = (pcm < 0) ? 0x80 : 0x00;
+  if (pcm < 0) pcm = -pcm;
+  if (pcm > CLIP) pcm = CLIP;
+  pcm = pcm + BIAS;
+  // Convert linear to ulaw
+  static const uint16_t exp_lut[8] = {0x000,0x020,0x040,0x080,0x100,0x200,0x400,0x800};
+  exponent = 7;
+  for (int i=7; i>0; --i) {
+    if (pcm >= exp_lut[i]) { exponent = i; break; }
+  }
+  mantissa = (pcm >> (exponent + 3)) & 0x0F;
+  ulawbyte = ~(sign | (exponent << 4) | mantissa);
+  return ulawbyte;
+}
 
-void app_main(void)
-{
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // GPIO34 - 12 bit resolution
-    // input = 3.3 V, when it is quiet the output hovers at VCC/2 so 3.3/2 = ~1.65 V = quiet
+// ===== μ-law decode =====
+static inline int16_t ulaw2linear(uint8_t u_val) {
+  u_val = ~u_val;
+  int t = ((u_val & 0x0F) << 3) + 0x84;
+  t <<= ((unsigned)u_val & 0x70) >> 4;
+  return (u_val & 0x80) ? (0x84 - t) : (t - 0x84);
+}
 
-    // LED
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << LED),
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE
-    };
-    gpio_config(&io_conf);
+// ===== Packet format =====
+typedef struct __attribute__((packed)) {
+  uint32_t seq;
+  uint16_t sr;       // sample rate / 100 (160 = 16 kHz)
+  uint16_t n;        // samples in block
+  uint8_t  data[BLOCK_SAMPLES]; // μ-law data
+} audio_pkt_t;
 
-    // DAC
-    gpio_config_t io_conf2 = {
-      .intr_type = GPIO_INTR_DISABLE,
-      .mode = GPIO_MODE_OUTPUT,
-      .pin_bit_mask = (1ULL << LED),
-      .pull_down_en = GPIO_PULLDOWN_DISABLE,
-      .pull_up_en = GPIO_PULLUP_DISABLE
-    };
-    gpio_config(&io_conf2);
 
-    int led_state = 1;
-    gpio_set_level(LED, led_state);
+// // Optional: simple jitter info
 
-    while (1) {
-        int val = adc1_get_raw(ADC1_CHANNEL_6);
-        printf("ADC Raw: %d\n", val);
-        float voltage = ((float)val/4095)* 3.3; // raw voltage divided by 2^12 bits - 1 * 3.3v
-        printf("Output Voltage: %.5f\n", voltage);
+volatile uint32_t seq_no = 0;
+volatile uint32_t last_seq = 0;
+volatile uint32_t recv_count = 0;
 
-        if (led_state != 1 && voltage > 1.70)
-        {
-            led_state = 1;
-            gpio_set_level(LED, led_state);
-            gpio_set_level(DAC, led_state);
-        }
-        else if(led_state !=0 && voltage < 1.55){
-            led_state = 0;
-            gpio_set_level(LED, led_state);
-            gpio_set_level(DAC, led_state);
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
+// ===== Version-safe callbacks (send only needed here) =====
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+void onSend(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  // Optional: log send status
+}
+#else
+void onSend(const uint8_t *mac, esp_now_send_status_t status) {
+  // Optional: log send status
+}
+#endif
+
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+void onRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
+  Serial.println("got to recv1");
+  if (len < (int)(sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t))) return;
+  const audio_pkt_t *pkt = (const audio_pkt_t*)incomingData;
+  recv_count++;
+  last_seq = pkt->seq;
+
+  // Decode into 32-bit I2S frames (stereo duplicated)
+  static int32_t out32[BLOCK_SAMPLES*2];
+  int n = pkt->n;
+  if (n > BLOCK_SAMPLES) n = BLOCK_SAMPLES;
+  for (int i=0; i<n; ++i) {
+    int16_t s16 = ulaw2linear(pkt->data[i]);
+    int32_t s32 = ((int32_t)s16) << 16;  // 16->32 align MSBs
+    out32[2*i+0] = s32;
+    out32[2*i+1] = s32;
+  }
+  size_t written = 0;
+  esp_err_t write_err = i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
+  if (write_err == ESP_OK) {
+    Serial.println("wrote ok");
+  }
+  else {
+    Serial.println(write_err);
+    Serial.println("did not write ok");
+  }\
+}
+#else
+void onRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  Serial.println("got to recv2");
+  if (len < (int)(sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t))) return;
+  const audio_pkt_t *pkt = (const audio_pkt_t*)incomingData;
+  Serial.println("got in front of for loop");
+  recv_count++;
+  last_seq = pkt->seq;
+  static int32_t out32[BLOCK_SAMPLES*2];
+  int n = pkt->n;
+  if (n > BLOCK_SAMPLES) n = BLOCK_SAMPLES;
+  for (int i=0; i<n; ++i) {
+    int16_t s16 = ulaw2linear(pkt->data[i]);
+    int32_t s32 = ((int32_t)s16) << 16;
+    out32[2*i+0] = s32;
+    out32[2*i+1] = s32;
+  }
+  size_t written = 0;
+  esp_err_t write_err = i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
+  if (write_err == ESP_OK) {
+    Serial.println("wrote ok");
+  }
+  else {
+    Serial.println(write_err);
+    Serial.println("did not write ok");
+  }
+}
+#endif
+
+bool addPeerBroadcast(uint8_t ch) {
+  esp_now_peer_info_t p{};
+  memcpy(p.peer_addr, BCAST_ADDR, 6);
+  p.channel = ch;
+  p.encrypt = false;
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+  p.ifidx = WIFI_IF_STA;
+#endif
+  if (esp_now_is_peer_exist(BCAST_ADDR)) esp_now_del_peer(BCAST_ADDR);
+  return esp_now_add_peer(&p) == ESP_OK;
+}
+
+void setChannel(uint8_t ch) {
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+}
+
+void i2sMicBegin() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_MIC_BCK_PIN,
+    .ws_io_num = I2S_MIC_WS_PIN,
+    .data_out_num = -1,
+    .data_in_num = I2S_SD_IN_PIN
+  };
+  i2s_driver_install(I2S_MIC_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_MIC_PORT, &pins);
+  i2s_set_clk(I2S_MIC_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
+}
+
+void i2sDacBegin() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 6,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_DAC_BCK_PIN,
+    .ws_io_num = I2S_DAC_WS_PIN,
+    .data_out_num = I2S_SD_OUT_PIN,
+    .data_in_num = -1
+  };
+  i2s_driver_install(I2S_DAC_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_DAC_PORT, &pins);
+  i2s_set_clk(I2S_DAC_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("ESP-NOW Audio TX @ 16kHz, mu-law");
+
+  pinMode(BUTTON_PIN, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, CHANGE); //want to catch both rising and falling edge of the button
+
+  WiFi.mode(WIFI_STA);
+  setChannel(WIFI_CHANNEL);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed"); while(1) delay(1000);
+  }
+
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+  esp_now_register_send_cb(onSend);
+#else
+  esp_now_register_send_cb(onSend);
+#endif
+
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+  esp_now_register_recv_cb(onRecv);
+#else
+  esp_now_register_recv_cb(onRecv);
+#endif
+
+  if (!addPeerBroadcast(WIFI_CHANNEL)) {
+    Serial.println("Peer add failed"); while(1) delay(1000);
+  }
+
+  i2sMicBegin();
+  i2sDacBegin();
+}
+
+void loop() {
+    if (buttonFlag) {
+    // Read 32-bit samples from I2S mic, convert to 16-bit, μ-law encode
+    const int SAMPLES = BLOCK_SAMPLES;
+    int32_t in32[SAMPLES];
+    size_t bytesRead = 0;
+    int frames = (i2s_read(I2S_MIC_PORT, (void*)in32, SAMPLES * sizeof(int32_t), &bytesRead, portMAX_DELAY) == ESP_OK)
+                ? (bytesRead / sizeof(int32_t)) : 0;
+    if (frames <= 0) return;
+
+    audio_pkt_t pkt{};
+    pkt.seq = seq_no++;
+    pkt.sr = SAMPLE_RATE / 100;
+    pkt.n  = frames;
+
+    for (int i=0; i<frames && i<BLOCK_SAMPLES; ++i) {
+      // INMP441 outputs 24-bit in 32-bit word, typically MSB-aligned
+      int32_t s = in32[i] >> 8;      // reduce to ~24->16 bits
+      if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+      pkt.data[i] = linear2ulaw((int16_t)s);
+    }
+    // if(buttonFlag){
+      esp_err_t my_err = esp_now_send(BCAST_ADDR, (uint8_t*)&pkt, sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t)+pkt.n);
+      if (my_err == ESP_OK) {
+        Serial.println("no error so happy");
+      }
+      else {
+        Serial.println("yes error so sad");
+      }
     }
 }
