@@ -25,8 +25,8 @@
 
 // new DAC pins for I2S1 (TX)
 #define I2S_DAC_PORT     I2S_NUM_1
-#define I2S_DAC_BCK_PIN  14   // BCLK (DAC)
-#define I2S_DAC_WS_PIN   27   // LRCLK/WS (DAC)
+#define I2S_DAC_BCK_PIN  26   // BCLK (DAC)
+#define I2S_DAC_WS_PIN   25   // LRCLK/WS (DAC)
 #define I2S_SD_OUT_PIN   22   // DOUT (ESP32 -> DAC)
 
 
@@ -114,6 +114,7 @@ void onSend(const uint8_t *mac, esp_now_send_status_t status) {
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
 void onRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
+  Serial.println("got to recv1");
   if (len < (int)(sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t))) return;
   const audio_pkt_t *pkt = (const audio_pkt_t*)incomingData;
   recv_count++;
@@ -130,12 +131,21 @@ void onRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len)
     out32[2*i+1] = s32;
   }
   size_t written = 0;
-  i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
+  esp_err_t write_err = i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
+  if (write_err == ESP_OK) {
+    Serial.println("wrote ok");
+  }
+  else {
+    Serial.println(write_err);
+    Serial.println("did not write ok");
+  }
 }
 #else
 void onRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  Serial.println("got to recv2");
   if (len < (int)(sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t))) return;
   const audio_pkt_t *pkt = (const audio_pkt_t*)incomingData;
+  Serial.println("got in front of for loop");
   recv_count++;
   last_seq = pkt->seq;
   static int32_t out32[BLOCK_SAMPLES*2];
@@ -148,7 +158,14 @@ void onRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     out32[2*i+1] = s32;
   }
   size_t written = 0;
-  i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
+  esp_err_t write_err = i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
+  if (write_err == ESP_OK) {
+    Serial.println("wrote ok");
+  }
+  else {
+    Serial.println(write_err);
+    Serial.println("did not write ok");
+  }
 }
 #endif
 
@@ -256,7 +273,6 @@ void setup() {
 
 void loop() {
     if (buttonFlag) {
-      Serial.println("button being pressed")
     // Read 32-bit samples from I2S mic, convert to 16-bit, μ-law encode
     const int SAMPLES = BLOCK_SAMPLES;
     int32_t in32[SAMPLES];
