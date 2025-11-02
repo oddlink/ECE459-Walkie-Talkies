@@ -1,185 +1,47 @@
-/*
-  ESP32 Walkie-Talkie (Transmitter)
-  - Captures mono audio from I2S mic (e.g., INMP441)
-  - μ-law encodes to 8-bit @ 16 kHz
-  - Sends blocks over ESP-NOW broadcast
-*/
-
-#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <driver/i2s.h>
+#include <SPI.h>
+#include "esp_system.h"
 #include <esp_wifi.h>
-#include <esp_wifi_types.h>
-#include "driver/i2s.h"
 
+#define I2S_WS      25  // LR clock (WS)
+#define I2S_SCK     26  // BCLK
+#define I2S_SD      32  // Data in from INMP441
+#define I2S_SD_OUT_PIN   22   // Data out to DAC
 
+#define BUTTON      21
 
-#define BUTTON_PIN       21   // Push button
-
-// keep mic pins (your existing)
-// I2S0 (mic)
-#define I2S_MIC_PORT     I2S_NUM_0
-#define I2S_MIC_BCK_PIN  26   // BCLK (mic)
-#define I2S_MIC_WS_PIN   25   // LRCLK/WS (mic)
-#define I2S_SD_IN_PIN    32   // SD (mic -> ESP32)
-
-// new DAC pins for I2S1 (TX)
-#define I2S_DAC_PORT     I2S_NUM_1
-#define I2S_DAC_BCK_PIN  26   // BCLK (DAC)
-#define I2S_DAC_WS_PIN   25   // LRCLK/WS (DAC)
-#define I2S_SD_OUT_PIN   22   // DOUT (ESP32 -> DAC)
-
-
-
-// -------- AUDIO SETTINGS --------
-#define SAMPLE_RATE      16000
-#define BLOCK_SAMPLES    160     // 10 ms @ 16 kHz
-// μ-law gives 1 byte per sample => 160 bytes payload per block
-
-// -------- ESP-NOW / WIFI --------
 #define WIFI_CHANNEL     6
-static uint8_t BCAST_ADDR[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+bool broadcast_mode = true;
+uint8_t BroadcastMac[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+const int GAIN = 5;
 
-volatile bool buttonFlag = false;
-volatile bool buttonDisabled = false;
-unsigned long lastISRTime = 0;
+const i2s_port_t I2S_PORT = I2S_NUM_0; // single I2S port used for both RX and TX
+
+// state
+bool ButtonState = true;
+volatile unsigned long lastISRTime = 0;
 const unsigned long debounceDelay = 200;
+bool sending = false;
+bool prevButtonState = true;
 
 void IRAM_ATTR onButtonPress() {
   unsigned long now = (unsigned long) (esp_timer_get_time() / 1000);
   if (now - lastISRTime > debounceDelay) {
-    buttonFlag = !buttonFlag; //will turn on on rising edge and off on falling edge
+    ButtonState = !ButtonState;
     lastISRTime = now;
   }
 }
 
-
-// ===== μ-law encode =====
-static inline uint8_t linear2ulaw(int16_t pcm) {
-  const uint16_t BIAS = 0x84; // 132
-  const uint16_t CLIP = 32635;
-  uint16_t mag;
-  uint8_t sign;
-  uint8_t exponent;
-  uint8_t mantissa;
-  uint8_t ulawbyte;
-
-  sign = (pcm < 0) ? 0x80 : 0x00;
-  if (pcm < 0) pcm = -pcm;
-  if (pcm > CLIP) pcm = CLIP;
-  pcm = pcm + BIAS;
-  // Convert linear to ulaw
-  static const uint16_t exp_lut[8] = {0x000,0x020,0x040,0x080,0x100,0x200,0x400,0x800};
-  exponent = 7;
-  for (int i=7; i>0; --i) {
-    if (pcm >= exp_lut[i]) { exponent = i; break; }
+void setPeer () {
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, BroadcastMac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
   }
-  mantissa = (pcm >> (exponent + 3)) & 0x0F;
-  ulawbyte = ~(sign | (exponent << 4) | mantissa);
-  return ulawbyte;
-}
-
-// ===== μ-law decode =====
-static inline int16_t ulaw2linear(uint8_t u_val) {
-  u_val = ~u_val;
-  int t = ((u_val & 0x0F) << 3) + 0x84;
-  t <<= ((unsigned)u_val & 0x70) >> 4;
-  return (u_val & 0x80) ? (0x84 - t) : (t - 0x84);
-}
-
-// ===== Packet format =====
-typedef struct __attribute__((packed)) {
-  uint32_t seq;
-  uint16_t sr;       // sample rate / 100 (160 = 16 kHz)
-  uint16_t n;        // samples in block
-  uint8_t  data[BLOCK_SAMPLES]; // μ-law data
-} audio_pkt_t;
-
-
-// // Optional: simple jitter info
-
-volatile uint32_t seq_no = 0;
-volatile uint32_t last_seq = 0;
-volatile uint32_t recv_count = 0;
-
-// ===== Version-safe callbacks (send only needed here) =====
-#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
-void onSend(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-  // Optional: log send status
-}
-#else
-void onSend(const uint8_t *mac, esp_now_send_status_t status) {
-  // Optional: log send status
-}
-#endif
-
-#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
-void onRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
-  Serial.println("got to recv1");
-  if (len < (int)(sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t))) return;
-  const audio_pkt_t *pkt = (const audio_pkt_t*)incomingData;
-  recv_count++;
-  last_seq = pkt->seq;
-
-  // Decode into 32-bit I2S frames (stereo duplicated)
-  static int32_t out32[BLOCK_SAMPLES*2];
-  int n = pkt->n;
-  if (n > BLOCK_SAMPLES) n = BLOCK_SAMPLES;
-  for (int i=0; i<n; ++i) {
-    int16_t s16 = ulaw2linear(pkt->data[i]);
-    int32_t s32 = ((int32_t)s16) << 16;  // 16->32 align MSBs
-    out32[2*i+0] = s32;
-    out32[2*i+1] = s32;
-  }
-  size_t written = 0;
-  esp_err_t write_err = i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
-  if (write_err == ESP_OK) {
-    Serial.println("wrote ok");
-  }
-  else {
-    Serial.println(write_err);
-    Serial.println("did not write ok");
-  }\
-}
-#else
-void onRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-  Serial.println("got to recv2");
-  if (len < (int)(sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t))) return;
-  const audio_pkt_t *pkt = (const audio_pkt_t*)incomingData;
-  Serial.println("got in front of for loop");
-  recv_count++;
-  last_seq = pkt->seq;
-  static int32_t out32[BLOCK_SAMPLES*2];
-  int n = pkt->n;
-  if (n > BLOCK_SAMPLES) n = BLOCK_SAMPLES;
-  for (int i=0; i<n; ++i) {
-    int16_t s16 = ulaw2linear(pkt->data[i]);
-    int32_t s32 = ((int32_t)s16) << 16;
-    out32[2*i+0] = s32;
-    out32[2*i+1] = s32;
-  }
-  size_t written = 0;
-  esp_err_t write_err = i2s_write(I2S_DAC_PORT, (const char*)out32, n*2*sizeof(int32_t), &written, portMAX_DELAY);
-  if (write_err == ESP_OK) {
-    Serial.println("wrote ok");
-  }
-  else {
-    Serial.println(write_err);
-    Serial.println("did not write ok");
-  }
-}
-#endif
-
-bool addPeerBroadcast(uint8_t ch) {
-  esp_now_peer_info_t p{};
-  memcpy(p.peer_addr, BCAST_ADDR, 6);
-  p.channel = ch;
-  p.encrypt = false;
-#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
-  p.ifidx = WIFI_IF_STA;
-#endif
-  if (esp_now_is_peer_exist(BCAST_ADDR)) esp_now_del_peer(BCAST_ADDR);
-  return esp_now_add_peer(&p) == ESP_OK;
 }
 
 void setChannel(uint8_t ch) {
@@ -188,118 +50,156 @@ void setChannel(uint8_t ch) {
   esp_wifi_set_promiscuous(false);
 }
 
-void i2sMicBegin() {
-  i2s_config_t cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 256,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
-  };
-  i2s_pin_config_t pins = {
-    .bck_io_num = I2S_MIC_BCK_PIN,
-    .ws_io_num = I2S_MIC_WS_PIN,
-    .data_out_num = -1,
-    .data_in_num = I2S_SD_IN_PIN
-  };
-  i2s_driver_install(I2S_MIC_PORT, &cfg, 0, NULL);
-  i2s_set_pin(I2S_MIC_PORT, &pins);
-  i2s_set_clk(I2S_MIC_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
 
-void i2sDacBegin() {
+void OnDataRecv(const uint8_t *info, const uint8_t *data, int len) {
+  // Expecting incoming buffer of int16_t samples
+  if (len <= 0) return;
+
+  // Don't play back while we're in sending state
+  if (sending) return;
+
+  // len bytes == N * 2 (int16_t). We'll convert each int16 sample to a 32-bit I2S word,
+  // duplicate to both channels (stereo) and write to I2S TX.
+  int16_t *inSamples = (int16_t *)data;
+  int sampleCount = len / 2;
+
+  // Prepare output buffer: each I2S "frame" is a 32-bit sample per channel, we will create stereo pairs
+  // so outSamples length = sampleCount * 2 (left+right) of int32_t
+  // For memory safety, chunk the write if sampleCount is large.
+  const int CHUNK = 128;
+  int idx = 0;
+  while (idx < sampleCount) {
+    int chunkSamples = min(CHUNK, sampleCount - idx);
+    int32_t outBuf[CHUNK * 2]; // stereo
+    for (int i = 0; i < chunkSamples; ++i) {
+      int16_t s = inSamples[idx + i];
+      // Convert 16-bit to 32-bit left-aligned (MSB) for the DAC:
+      // place 16-bit sample into high 16 bits of 32-bit word (common approach)
+      int32_t s32 = ((int32_t)s) << 16;
+      // duplicate to stereo
+      outBuf[2 * i + 0] = s32;
+      outBuf[2 * i + 1] = s32;
+    }
+    size_t bytes_written = 0;
+    i2s_write(I2S_PORT, outBuf, chunkSamples * 2 * sizeof(int32_t), &bytes_written, portMAX_DELAY);
+    idx += chunkSamples;
+  }
+}
+
+// Setup single I2S driver in full-duplex mode
+bool i2sInstalled = false;
+void setupI2SFullDuplex() {
+  if (i2sInstalled) return;
+
+  // uninstall any previously installed driver on this port (safe)
+  i2s_driver_uninstall(I2S_PORT);
+
   i2s_config_t cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
+    .sample_rate = 16000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // use 32-bit frames for flexibility
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // stereo frames
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 6,
     .dma_buf_len = 256,
-    .use_apll = false,
+    .use_apll = true,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0
   };
+  
   i2s_pin_config_t pins = {
-    .bck_io_num = I2S_DAC_BCK_PIN,
-    .ws_io_num = I2S_DAC_WS_PIN,
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
     .data_out_num = I2S_SD_OUT_PIN,
-    .data_in_num = -1
+    .data_in_num = I2S_SD
   };
-  i2s_driver_install(I2S_DAC_PORT, &cfg, 0, NULL);
-  i2s_set_pin(I2S_DAC_PORT, &pins);
-  i2s_set_clk(I2S_DAC_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
+
+  esp_err_t err = i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("Failed installing I2S driver: %d\n", err);
+    return;
+  }
+  err = i2s_set_pin(I2S_PORT, &pins);
+  if (err != ESP_OK) {
+    Serial.printf("Failed setting I2S pins: %d\n", err);
+    return;
+  }
+  // set clock explicitly (sample rate, bits, channels)
+  i2s_set_clk(I2S_PORT, 16000, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
+  i2s_zero_dma_buffer(I2S_PORT);
+
+  i2sInstalled = true;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  Serial.println("ESP-NOW Audio TX @ 16kHz, mu-law");
-
-  pinMode(BUTTON_PIN, INPUT_PULLDOWN);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, CHANGE); //want to catch both rising and falling edge of the button
+  pinMode(BUTTON, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(BUTTON), onButtonPress, CHANGE);
 
   WiFi.mode(WIFI_STA);
+  setupI2SFullDuplex();
+
   setChannel(WIFI_CHANNEL);
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed"); while(1) delay(1000);
+    Serial.println("ESP-NOW Init Failed");
+    return;
   }
+  setPeer();
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
 
-#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
-  esp_now_register_send_cb(onSend);
-#else
-  esp_now_register_send_cb(onSend);
-#endif
-
-#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
-  esp_now_register_recv_cb(onRecv);
-#else
-  esp_now_register_recv_cb(onRecv);
-#endif
-
-  if (!addPeerBroadcast(WIFI_CHANNEL)) {
-    Serial.println("Peer add failed"); while(1) delay(1000);
-  }
-
-  i2sMicBegin();
-  i2sDacBegin();
+  Serial.println("Walkie Talkie (single I2S full-duplex) Set Up");
 }
 
 void loop() {
-    if (buttonFlag) {
-    // Read 32-bit samples from I2S mic, convert to 16-bit, μ-law encode
-    const int SAMPLES = BLOCK_SAMPLES;
-    int32_t in32[SAMPLES];
-    size_t bytesRead = 0;
-    int frames = (i2s_read(I2S_MIC_PORT, (void*)in32, SAMPLES * sizeof(int32_t), &bytesRead, portMAX_DELAY) == ESP_OK)
-                ? (bytesRead / sizeof(int32_t)) : 0;
-    if (frames <= 0) return;
-
-    audio_pkt_t pkt{};
-    pkt.seq = seq_no++;
-    pkt.sr = SAMPLE_RATE / 100;
-    pkt.n  = frames;
-
-    for (int i=0; i<frames && i<BLOCK_SAMPLES; ++i) {
-      // INMP441 outputs 24-bit in 32-bit word, typically MSB-aligned
-      int32_t s = in32[i] >> 8;      // reduce to ~24->16 bits
-      if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
-      pkt.data[i] = linear2ulaw((int16_t)s);
+  // detect edge change and switch sending/receiving state
+  if (ButtonState != prevButtonState) {
+    prevButtonState = ButtonState;
+    sending = ButtonState;
+    if (sending) {
+      // stop rx callback while sending (optional)
+      esp_now_register_recv_cb(NULL);
+      Serial.println("Switching to SENDING (mic -> network)");
+    } else {
+      // restore rx callback for playback
+      esp_now_register_recv_cb(OnDataRecv);
+      Serial.println("Switching to RECEIVING (network -> speaker)");
     }
-    // if(buttonFlag){
-      esp_err_t my_err = esp_now_send(BCAST_ADDR, (uint8_t*)&pkt, sizeof(uint32_t)+sizeof(uint16_t)+sizeof(uint16_t)+pkt.n);
-      if (my_err == ESP_OK) {
-        Serial.println("no error so happy");
+  }
+
+  if (sending) {
+    // Capture from I2S RX, convert to int16_t network samples, send via ESP-NOW
+    const int SAMPLES = 100; // number of frames to read (frames are stereo 32-bit words)
+    // we'll read SAMPLES * 1 (frame per sample) but we only care about one channel (mic is left)
+    int32_t inBuf[SAMPLES]; // read 32-bit frames (we configured stereo but mic likely uses left only)
+    size_t bytes_read = 0;
+    // read SAMPLES frames of 32-bit each (mono word per frame because channel_format is stereo but mic provides data in left)
+    esp_err_t r = i2s_read(I2S_PORT, inBuf, sizeof(inBuf), &bytes_read, portMAX_DELAY);
+    if (r == ESP_OK && bytes_read > 0) {
+      int framesRead = bytes_read / sizeof(int32_t); // number of 32-bit frames read
+      // convert frames to int16_t samples for sending
+      int16_t outSamples[framesRead];
+      for (int i = 0; i < framesRead; ++i) {
+        int32_t w = inBuf[i];
+        // Extract a 16-bit sample from the 32-bit word.
+        // Common INMP441 alignment: 32-bit word left-aligned with 24-bit data in high bits.
+        // Here we assume high 16 bits contain the meaningful audio; shift right 16 to get 16-bit sample.
+        // If your mic alignment differs, change this shift.
+        int16_t s16 = (int16_t)(w >> 16);
+
+        // apply gain safely
+        int32_t amplified = (int32_t)s16 * GAIN;
+        if (amplified > 32767) amplified = 32767;
+        if (amplified < -32768) amplified = -32768;
+        outSamples[i] = (int16_t)amplified;
       }
-      else {
-        Serial.println("yes error so sad");
-      }
+      // send the data over ESP-NOW
+      esp_now_send(BroadcastMac, (uint8_t*)outSamples, framesRead * sizeof(int16_t));
     }
+    delay(2);
+  } // end sending
 }
