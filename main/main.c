@@ -16,8 +16,8 @@
 #define I2S_SD_OUT_PIN   22   // Data out to DAC
 
 #define BUTTON      21
-#define RED_LED     18
-#define GREEN_LED   19
+#define RED_LED     15
+#define GREEN_LED   2
 
 #define WIFI_CHANNEL     6
 bool broadcast_mode = true;
@@ -30,7 +30,7 @@ const int GAIN = 5;
 const i2s_port_t I2S_PORT = I2S_NUM_0; // single I2S port used for both RX and TX
 
 // state
-bool ButtonState = true;
+bool ButtonState = false;
 volatile unsigned long lastISRTime = 0;
 const unsigned long debounceDelay = 40;
 bool sending = false;
