@@ -4,6 +4,8 @@
 #include <SPI.h>
 #include "esp_system.h"
 #include <esp_wifi.h>
+#include <nRF24L01.h>
+#include <RF24.h>
 
 // μ-law constants
 #define MU_LAW_MAX 0x1FFF
@@ -22,34 +24,38 @@
 #define WIFI_CHANNEL     6
 bool broadcast_mode = true;
 uint8_t BroadcastMac[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-// uint8_t Mac1[] = {0xCC,0xDB,0xA7,0x96,0xFD,0x64};
-// uint8_t Mac2[] = {0xCC,0xDB,0xA7,0x9E,0x8A,0xB4};
+uint8_t Mac1[] = {0xCC,0xDB,0xA7,0x96,0xFD,0x64};
+uint8_t Mac2[] = {0xCC,0xDB,0xA7,0x9E,0x8A,0xB4};
 // uint8_t Mac3[] = {0x88,0x57,0x21,0x8E,0xE0,0x4C};
-const int GAIN = 5;
+const int GAIN = 1;
 
 const i2s_port_t I2S_PORT = I2S_NUM_0; // single I2S port used for both RX and TX
 
 // state
 bool ButtonState = false;
 volatile unsigned long lastISRTime = 0;
-const unsigned long debounceDelay = 40;
+const unsigned long debounceDelay = 20;
 bool sending = false;
 bool prevButtonState = true;
 volatile bool ignoreButton = false;   
 unsigned long lastRecvMillis = 0;     // updated by OnDataRecv when audio arrives
-const unsigned long RECEIVE_TIMEOUT_MS = 800; // time after last packet to re-enable button
+const unsigned long RECEIVE_TIMEOUT_MS = 600; // time after last packet to re-enable button
 bool receivingActive = false;  
+
+volatile bool acknowledged = false;
 
 
 void IRAM_ATTR onButtonPress() {
   // If actively receiving, ignore button presses, do nothing
   if (ignoreButton) return;
 
-  unsigned long now = (unsigned long) (esp_timer_get_time() / 1000);
-  if (now - lastISRTime > debounceDelay) {
-    ButtonState = !ButtonState;
-    lastISRTime = now;
-  }
+  // unsigned long now = (unsigned long) (esp_timer_get_time() / 1000);
+  // if (now - lastISRTime > debounceDelay) {
+    // ButtonState = !ButtonState;
+    ButtonState = digitalRead(BUTTON);
+  //   lastISRTime = now;
+  // }
+  
 }
 
 uint8_t linearToMulaw(int16_t sample) {
@@ -119,6 +125,18 @@ void OnDataRecv(const uint8_t *info, const uint8_t *data, int len) {
   // Expecting incoming buffer of int16_t samples
   if (len <= 0) return;
 
+  if((len == 12 && String((char*)data).equals("ANYONE HOME"))){
+    Serial.println("Received the correct ping. Sending back ACK");
+    esp_now_send(BroadcastMac, Mac1, 6);
+    return;
+  }
+
+  if(len == 6 && memcmp(data, Mac1, 6) == 0){
+    Serial.println("Received mac acknowledgement");
+    acknowledged = true;
+    return;
+  }
+
   // Mark that we are actively receiving (prevent button toggles)
   receivingActive = true;
   ignoreButton = true;
@@ -174,12 +192,12 @@ void setupI2SFullDuplex() {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
     .sample_rate = 16000,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // use 32-bit frames for flexibility
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // stereo frames
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // stereo frames
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 6,
     .dma_buf_len = 256,
-    .use_apll = true,
+    .use_apll = false,//true,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0
   };
@@ -247,20 +265,40 @@ void loop() {
   if (ButtonState != prevButtonState) {
     prevButtonState = ButtonState;
     sending = ButtonState;
-    digitalWrite(GREEN_LED, ButtonState);//
+    // digitalWrite(GREEN_LED, ButtonState);
 
     if (sending) {
+      acknowledged = false;
+      unsigned long startTime = millis();
+      const unsigned long timeout = 3000; // 3 seconds
       // stop rx callback while sending (optional)
       esp_now_register_recv_cb(NULL);
       Serial.println("Switching to SENDING (mic -> network)");
+
+      Serial.println("Pinging out to receivers");
+      uint8_t ping_message[12] = "ANYONE HOME";
+      esp_now_send(BroadcastMac, ping_message, 12);
+
+      while (!acknowledged && millis() - startTime < timeout) { //waits a max of 3 seconds for an acknowledgement to come through
+        delay(10); 
+      }
+      if(acknowledged){
+        Serial.println("Ping acknowledged with mac address");
+        digitalWrite(GREEN_LED, ButtonState);
+      }
+      else{
+        Serial.println("Not acknowledged, try using RF");
+      }
+
     } else {
       // restore rx callback for playback
+      digitalWrite(GREEN_LED, ButtonState);
       esp_now_register_recv_cb(OnDataRecv);
       Serial.println("Switching to RECEIVING (network -> speaker)");
     }
   }
 
-  if (sending) {
+  if (sending && acknowledged) { //if acknowledged use the wifi route
     // Capture from I2S RX, convert to int16_t network samples, send via ESP-NOW
     const int SAMPLES = 100; // number of frames to read (frames are stereo 32-bit words)
     // we'll read SAMPLES * 1 (frame per sample) but we only care about one channel (mic is left)
@@ -278,9 +316,9 @@ void loop() {
         // Common INMP441 alignment: 32-bit word left-aligned with 24-bit data in high bits.
         // Here we assume high 16 bits contain the meaningful audio; shift right 16 to get 16-bit sample.
         // If your mic alignment differs, change this shift.
-        int16_t s16 = (int16_t)(w >> 16);
+        int16_t s16 = (int16_t)(w >> 14);
 
-        // apply gain safely
+        // apply gain safelyb
         int32_t amplified = (int32_t)s16 * GAIN;
         if (amplified > 32767) amplified = 32767;
         if (amplified < -32768) amplified = -32768;
@@ -294,7 +332,7 @@ void loop() {
         // Convert and apply gain
         for (int i = 0; i < framesRead; ++i) {
           int32_t w = inBuf[i];
-          int16_t s16 = (int16_t)(w >> 16);
+          int16_t s16 = (int16_t)(w >> 14);
           int32_t amplified = (int32_t)s16 * GAIN;
           if (amplified > 32767) amplified = 32767;
           if (amplified < -32768) amplified = -32768;
