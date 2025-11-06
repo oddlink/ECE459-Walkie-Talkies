@@ -18,8 +18,14 @@
 #define I2S_SD_OUT_PIN   22   // Data out to DAC
 
 #define BUTTON      21
-#define RED_LED     15
-#define GREEN_LED   2
+#define RED_LED     15 //receiving
+#define GREEN_LED   2  //wifi transmitting
+#define YELLOW_LED  13 //rf transmitting
+
+#define CE_PIN      4
+#define CSN_PIN     5
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[5] = {'W', 'A', 'L', 'K', 'I'};
 
 #define WIFI_CHANNEL     6
 bool broadcast_mode = true;
@@ -27,12 +33,14 @@ uint8_t BroadcastMac[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 uint8_t Mac1[] = {0xCC,0xDB,0xA7,0x96,0xFD,0x64};
 uint8_t Mac2[] = {0xCC,0xDB,0xA7,0x9E,0x8A,0xB4};
 // uint8_t Mac3[] = {0x88,0x57,0x21,0x8E,0xE0,0x4C};
+
+#define SAMPLE_RATE 16000
 const int GAIN = 1;
 
 const i2s_port_t I2S_PORT = I2S_NUM_0; // single I2S port used for both RX and TX
 
 // state
-bool ButtonState = false;
+bool ButtonPressed = false;
 volatile unsigned long lastISRTime = 0;
 const unsigned long debounceDelay = 20;
 bool sending = false;
@@ -51,8 +59,8 @@ void IRAM_ATTR onButtonPress() {
 
   // unsigned long now = (unsigned long) (esp_timer_get_time() / 1000);
   // if (now - lastISRTime > debounceDelay) {
-    // ButtonState = !ButtonState;
-    ButtonState = digitalRead(BUTTON);
+    // ButtonPressed = !ButtonPressed;
+    ButtonPressed = digitalRead(BUTTON);
   //   lastISRTime = now;
   // }
   
@@ -75,6 +83,19 @@ int16_t mulawToLinear(uint8_t muSample) {
   x = fabs(x);
   float linear = sign * ((pow(1.0f + MU, x) - 1.0f) / MU);
   return (int16_t)(linear * 32767.0f);
+}
+
+void radioSetup(){
+  // --- RADIO INIT ---
+  if (!radio.begin()) {
+    Serial.println("Radio not responding!");
+    while (1);
+  }
+  radio.openWritingPipe(address);
+  radio.openReadingPipe(1, address);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_1MBPS);
+  radio.startListening();
 }
 
 void setPeers () {
@@ -125,13 +146,18 @@ void OnDataRecv(const uint8_t *info, const uint8_t *data, int len) {
   // Expecting incoming buffer of int16_t samples
   if (len <= 0) return;
 
+  // Serial.println(String((char*)data));
   if((len == 12 && String((char*)data).equals("ANYONE HOME"))){
     Serial.println("Received the correct ping. Sending back ACK");
     esp_now_send(BroadcastMac, Mac1, 6);
     return;
   }
 
-  if(len == 6 && memcmp(data, Mac1, 6) == 0){
+  // Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+  //             Mac1[0], Mac1[1], Mac1[2], Mac1[3], Mac1[4], Mac1[5]);
+  // Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+  //             data[0], data[1], data[2], data[3], data[4], data[5]);
+  if(len == 6 && memcmp(data, Mac2, 6) == 0){
     Serial.println("Received mac acknowledgement");
     acknowledged = true;
     return;
@@ -190,7 +216,7 @@ void setupI2SFullDuplex() {
 
   i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
-    .sample_rate = 16000,
+    .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // use 32-bit frames for flexibility
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // stereo frames
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
@@ -220,7 +246,7 @@ void setupI2SFullDuplex() {
     return;
   }
   // set clock explicitly (sample rate, bits, channels)
-  i2s_set_clk(I2S_PORT, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+  i2s_set_clk(I2S_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
   i2s_zero_dma_buffer(I2S_PORT);
 
   i2sInstalled = true;
@@ -235,6 +261,8 @@ void setup() {
   digitalWrite(RED_LED, 0);
   pinMode(GREEN_LED, OUTPUT);
   digitalWrite(GREEN_LED, 0);
+  pinMode(YELLOW_LED, OUTPUT);
+  digitalWrite(YELLOW_LED, 0);
 
   WiFi.mode(WIFI_STA);
   setupI2SFullDuplex();
@@ -247,6 +275,8 @@ void setup() {
   setPeers();
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
+  radioSetup();
+  // radio.powerDown();//shut down radio to save power
 
   Serial.println("Walkie Talkie (single I2S full-duplex) Set Up");
 }
@@ -261,11 +291,11 @@ void loop() {
     Serial.println("Receive idle — button re-enabled");
   }
 
-  // existing edge-detection logic for ButtonState -> sending/receiving
-  if (ButtonState != prevButtonState) {
-    prevButtonState = ButtonState;
-    sending = ButtonState;
-    // digitalWrite(GREEN_LED, ButtonState);
+  // existing edge-detection logic for ButtonPressed -> sending/receiving
+  if (ButtonPressed != prevButtonState) {
+    prevButtonState = ButtonPressed;
+    sending = ButtonPressed;
+    // digitalWrite(GREEN_LED, ButtonPressed);
 
     if (sending) {
       acknowledged = false;
@@ -279,12 +309,16 @@ void loop() {
       uint8_t ping_message[12] = "ANYONE HOME";
       esp_now_send(BroadcastMac, ping_message, 12);
 
-      while (!acknowledged && millis() - startTime < timeout) { //waits a max of 3 seconds for an acknowledgement to come through
+      while (!acknowledged && millis() - startTime < timeout && ButtonPressed) { //waits a max of 3 seconds for an acknowledgement to come through
         delay(10); 
       }
-      if(acknowledged){
+      if(acknowledged && ButtonPressed){
         Serial.println("Ping acknowledged with mac address");
-        digitalWrite(GREEN_LED, ButtonState);
+        digitalWrite(GREEN_LED, ButtonPressed);
+      }
+      else if(!digitalRead(BUTTON)){ //catches if button is released before wifi ack comes in
+        prevButtonState = 0;
+        sending = 0;
       }
       else{
         Serial.println("Not acknowledged, try using RF");
@@ -292,8 +326,10 @@ void loop() {
 
     } else {
       // restore rx callback for playback
-      digitalWrite(GREEN_LED, ButtonState);
+      digitalWrite(GREEN_LED, ButtonPressed);
+      digitalWrite(YELLOW_LED, ButtonPressed);
       esp_now_register_recv_cb(OnDataRecv);
+      radio.startListening(); //TO-DO change later so that the radio is not always on, this is a bad power move
       Serial.println("Switching to RECEIVING (network -> speaker)");
     }
   }
@@ -356,4 +392,49 @@ void loop() {
     }
     delay(2);
   } // end sending
+  else if(sending && !acknowledged){ 
+    // radio.powerUp();
+    digitalWrite(YELLOW_LED, ButtonPressed);
+    radio.stopListening();
+    
+    const int FRAMES = 32; // small chunk for RF packet
+    int32_t inBuf[FRAMES];
+    size_t bytesRead = 0;
+    esp_err_t r = i2s_read(I2S_NUM_0, inBuf, sizeof(inBuf), &bytesRead, portMAX_DELAY);
+    if (r == ESP_OK && bytesRead > 0) {
+      int frames = bytesRead / sizeof(int32_t);
+      uint8_t encoded[FRAMES];
+      for (int i = 0; i < frames; i++) {
+        int16_t s16 = (int16_t)(inBuf[i] >> 16);
+        int32_t amplified = (int32_t)s16 * GAIN;
+        if (amplified > 32767) amplified = 32767;
+        if (amplified < -32768) amplified = -32768;
+        encoded[i] = linearToMulaw((int16_t)amplified);
+      }
+      radio.write(&encoded, frames);
+    }
+  }
+
+   if (!sending && radio.available()) {
+    digitalWrite(RED_LED, HIGH);
+    uint8_t encoded[32];
+    radio.read(&encoded, sizeof(encoded));
+
+    int16_t decoded[32];
+    for (int i = 0; i < 32; i++) {
+      decoded[i] = mulawToLinear(encoded[i]);
+    }
+
+    int32_t outBuf[64];
+    for (int i = 0; i < 32; i++) {
+      int32_t s32 = ((int32_t)decoded[i]) << 16;
+      outBuf[2 * i] = s32;
+      outBuf[2 * i + 1] = s32;
+    }
+    size_t written;
+    i2s_write(I2S_NUM_0, outBuf, sizeof(outBuf), &written, portMAX_DELAY);
+  }
+  else if(!sending && !radio.available()){
+    digitalWrite(RED_LED, LOW);
+  }
 }
