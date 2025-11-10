@@ -16,8 +16,8 @@
 #define LED_RX          2
 
 // ---------- AUDIO SETTINGS ----------
-#define SAMPLE_RATE     16000
-#define GAIN            5
+#define SAMPLE_RATE     8000
+#define GAIN            1
 
 // ---------- RF CONFIG ----------
 #define CE_PIN  4
@@ -30,6 +30,17 @@ volatile bool buttonPressed = false;
 bool sending = false;
 unsigned long lastPress = 0;
 const unsigned long debounceDelay = 50;
+
+// ---- RX ring buffer ----
+const int PACKET_SAMPLES = 32;
+const int BUFFER_PACKETS = 10;
+uint8_t rxBuffer[BUFFER_PACKETS][PACKET_SAMPLES];
+volatile int head = 0;
+volatile int tail = 0;
+volatile int count = 0;
+unsigned long lastPlay = 0;
+const unsigned long PLAY_INTERVAL_US = (PACKET_SAMPLES * 1000000UL) / SAMPLE_RATE; // 4000 µs
+
 
 // ---------- μ-LAW ----------
 uint8_t linearToMulaw(int16_t sample) {
@@ -66,7 +77,7 @@ void setupI2S() {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 6,
@@ -85,8 +96,10 @@ void setupI2S() {
 
   i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pins);
-  i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
   i2s_zero_dma_buffer(I2S_NUM_0);
+
+  
 }
 
 // ---------- SETUP ----------
@@ -112,6 +125,9 @@ void setup() {
   radio.openReadingPipe(1, address);
   radio.setPALevel(RF24_PA_LOW);
   radio.setDataRate(RF24_1MBPS);
+  radio.setPayloadSize(32);
+  radio.flush_tx();
+  radio.flush_rx();
   radio.startListening();
 
   Serial.println("RF Walkie-Talkie Ready");
@@ -138,41 +154,44 @@ void loop() {
 
   // ---------- TRANSMIT ----------
   if (sending) {
-    const int FRAMES = 32; // small chunk for RF packet
+    const int FRAMES = 32; 
     int32_t inBuf[FRAMES];
     size_t bytesRead = 0;
+
     esp_err_t r = i2s_read(I2S_NUM_0, inBuf, sizeof(inBuf), &bytesRead, portMAX_DELAY);
+    Serial.printf("Raw: 0x%08X  shifted: %d\n", inBuf[0], (int16_t)(inBuf[0] >> 16));
     if (r == ESP_OK && bytesRead > 0) {
-      int frames = bytesRead / sizeof(int32_t);
-      uint8_t encoded[FRAMES];
-      for (int i = 0; i < frames; i++) {
-        int16_t s16 = (int16_t)(inBuf[i] >> 16);
-        int32_t amplified = (int32_t)s16 * GAIN;
-        if (amplified > 32767) amplified = 32767;
-        if (amplified < -32768) amplified = -32768;
-        encoded[i] = linearToMulaw((int16_t)amplified);
-      }
-      radio.write(&encoded, frames);
+        int frames = bytesRead / sizeof(int32_t);
+        uint8_t encoded[FRAMES];
+        for (int i = 0; i < frames; i++) {
+            int16_t s16 = (int16_t)(inBuf[i] >> 16);
+            int32_t amplified = (int32_t)s16 * GAIN;
+            if (amplified >= 32767 || amplified <= -32768) Serial.println("CLIP");
+            if (amplified > 32767) amplified = 32767;
+            if (amplified < -32768) amplified = -32768;
+            encoded[i] = linearToMulaw((int16_t)amplified);
+        }
+        radio.write(encoded, 32);
     }
   }
 
   // ---------- RECEIVE ----------
-  if (!sending && radio.available()) {
+  else if (!sending && radio.available()) {
     uint8_t encoded[32];
-    radio.read(&encoded, sizeof(encoded));
+    radio.read(encoded, sizeof(encoded));
 
     int16_t decoded[32];
     for (int i = 0; i < 32; i++) {
       decoded[i] = mulawToLinear(encoded[i]);
     }
 
-    int32_t outBuf[64];
+    int32_t outBuf[32];
     for (int i = 0; i < 32; i++) {
-      int32_t s32 = ((int32_t)decoded[i]) << 16;
-      outBuf[2 * i] = s32;
-      outBuf[2 * i + 1] = s32;
+      outBuf[i] = ((int32_t)decoded[i]) << 16; 
     }
     size_t written;
-    i2s_write(I2S_NUM_0, outBuf, sizeof(outBuf), &written, portMAX_DELAY);
+    i2s_write(I2S_NUM_0, outBuf,
+              32 * sizeof(int32_t),
+              &written, portMAX_DELAY);
   }
 }
