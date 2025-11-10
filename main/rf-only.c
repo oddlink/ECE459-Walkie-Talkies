@@ -31,17 +31,6 @@ bool sending = false;
 unsigned long lastPress = 0;
 const unsigned long debounceDelay = 50;
 
-// ---- RX ring buffer ----
-const int PACKET_SAMPLES = 32;
-const int BUFFER_PACKETS = 10;
-uint8_t rxBuffer[BUFFER_PACKETS][PACKET_SAMPLES];
-volatile int head = 0;
-volatile int tail = 0;
-volatile int count = 0;
-unsigned long lastPlay = 0;
-const unsigned long PLAY_INTERVAL_US = (PACKET_SAMPLES * 1000000UL) / SAMPLE_RATE; // 4000 µs
-
-
 // ---------- μ-LAW ----------
 uint8_t linearToMulaw(int16_t sample) {
   const float MU = 255.0f;
