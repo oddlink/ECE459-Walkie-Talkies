@@ -126,12 +126,13 @@ const unsigned long RECEIVE_TIMEOUT_MS = 600;
 
 // ====== Button ISR ======
 void IRAM_ATTR onButton() {
-  if (ignoreButton) return;
   unsigned long now = (unsigned long)(esp_timer_get_time() / 1000);
   if (now - lastISRTime > debounceMs) {
     buttonEdge = true;      // edge detected, handle in loop()
     lastISRTime = now;
   }
+  if (ignoreButton) return;
+  
 }
 
 // ====== ESP-NOW callbacks ======
@@ -238,17 +239,21 @@ void loop() {
 
         const unsigned long startMs = millis();
         const unsigned long timeoutMs = 3000;
-        while (!wifiAcked && (millis() - startMs < timeoutMs)) {
+        while (!wifiAcked && (millis() - startMs < timeoutMs) && !buttonEdge) {
           delay(10);
         }
       }
 
-      if (wifiAcked) {
+      if (wifiAcked && !buttonEdge) {
         wifiSelected = true;
         digitalWrite(GREEN_LED, HIGH);
         digitalWrite(YELLOW_LED, LOW);
         Serial.println("Wi-Fi path ACKed → using ESP-NOW");
-      } else {
+      } 
+      else if (buttonEdge){
+        return;
+      }
+      else {
         wifiSelected = false;
         digitalWrite(GREEN_LED, LOW);
         digitalWrite(YELLOW_LED, HIGH);
