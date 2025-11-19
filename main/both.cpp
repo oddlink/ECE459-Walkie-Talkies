@@ -34,8 +34,8 @@ static inline int16_t mulawToLinear(uint8_t muSample) {
 #define I2S_SD_OUT_PIN  22    // DAC / speaker data out
 
 #define BUTTON_PIN      21
-#define RED_LED         15    // receiving indicator
-#define GREEN_LED       2     // Wi-Fi TX indicator
+#define RED_LED         2    // receiving indicator
+#define GREEN_LED       15     // Wi-Fi TX indicator
 #define YELLOW_LED      13    // RF TX indicator
 #define SD_CS           27    // SD card CS
 
@@ -97,7 +97,7 @@ static void addBroadcastPeer() {
 #define CE_PIN   4
 #define CSN_PIN  5
 RF24 radio(CE_PIN, CSN_PIN);
-static const byte RF_ADDR[6] = "00001";
+static const byte RF_ADDR[5] = {'W', 'A', 'L', 'K', 'I'};
 
 static bool radioSetup() {
   if (!radio.begin()) return false;
@@ -105,8 +105,8 @@ static bool radioSetup() {
   radio.openWritingPipe(RF_ADDR);
   radio.openReadingPipe(1, RF_ADDR);
   radio.setChannel(90);
-  radio.setPALevel(RF24_PA_LOW);
-  radio.setDataRate(RF24_1MBPS);
+  radio.setPALevel(RF24_PA_HIGH);
+  radio.setDataRate(RF24_250KBPS);
   radio.setPayloadSize(32);
   radio.flush_tx();
   radio.flush_rx();
@@ -410,6 +410,7 @@ void loop() {
 
       // stop RF RX
       radio.stopListening();
+      esp_now_register_recv_cb(NULL);
 
       // ping on ESP-NOW
       if (esp_now_is_peer_exist(BroadcastMac)) {
@@ -441,7 +442,10 @@ void loop() {
       // Enter RX
       digitalWrite(GREEN_LED, LOW);
       digitalWrite(YELLOW_LED, LOW);
+      esp_now_register_recv_cb(OnDataRecv);
       radio.startListening();
+      radio.flush_rx(); 
+      radio.flush_tx();
       Serial.println("RX mode");
     }
   }
