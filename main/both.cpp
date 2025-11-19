@@ -105,8 +105,8 @@ static bool radioSetup() {
   radio.openWritingPipe(RF_ADDR);
   radio.openReadingPipe(1, RF_ADDR);
   radio.setChannel(90);
-  radio.setPALevel(RF24_PA_HIGH);
-  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_1MBPS);
   radio.setPayloadSize(32);
   radio.flush_tx();
   radio.flush_rx();
