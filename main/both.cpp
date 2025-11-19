@@ -6,6 +6,7 @@
 #include <esp_wifi.h>
 #include <nRF24L01.h>
 #include <RF24.h>
+#include <SD.h>
 
 // ====== μ-law ======
 static inline uint8_t linearToMulaw(int16_t sample) {
@@ -36,6 +37,9 @@ static inline int16_t mulawToLinear(uint8_t muSample) {
 #define RED_LED         15    // receiving indicator
 #define GREEN_LED       2     // Wi-Fi TX indicator
 #define YELLOW_LED      13    // RF TX indicator
+#define SD_CS           27    // SD card CS
+
+#define PLAY_BUTTON_PIN 12    // Play rx.wav from SD card when pressed
 
 // ====== Audio/I2S ======
 #define SAMPLE_RATE       8000
@@ -124,6 +128,148 @@ volatile bool ignoreButton = false;
 unsigned long lastRecvMillis = 0;
 const unsigned long RECEIVE_TIMEOUT_MS = 600;
 
+// ====== WAV recording state ======
+static const size_t WAV_SAMPLES_PER_CHUNK = 512;   // like your mic code
+static const uint32_t RECORD_DURATION_MS = 15000;  // record 15 s after first RX
+
+File wavFile;
+int16_t wavChunk[WAV_SAMPLES_PER_CHUNK];
+volatile size_t wavIndex = 0;
+volatile bool wavChunkReady = false;
+
+bool recordingActive = false;
+bool recordingFinalized = false;
+uint32_t recordingStartMs = 0;
+
+// Little-endian helpers
+static void write_le_u32(File &f, uint32_t v) {
+  uint8_t b[4] = {
+    (uint8_t)(v & 0xFF),
+    (uint8_t)((v >> 8) & 0xFF),
+    (uint8_t)((v >> 16) & 0xFF),
+    (uint8_t)((v >> 24) & 0xFF)
+  };
+  f.write(b, 4);
+}
+static void write_le_u16(File &f, uint16_t v) {
+  uint8_t b[2] = {
+    (uint8_t)(v & 0xFF),
+    (uint8_t)((v >> 8) & 0xFF)
+  };
+  f.write(b, 2);
+}
+
+// Begin WAV: PCM, mono, 16-bit, SAMPLE_RATE
+bool wav_begin(File &f, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
+  if (!f) return false;
+
+  // RIFF
+  f.write((const uint8_t*)"RIFF", 4);
+  write_le_u32(f, 0); // placeholder
+  f.write((const uint8_t*)"WAVE", 4);
+
+  // fmt chunk
+  f.write((const uint8_t*)"fmt ", 4);
+  write_le_u32(f, 16);         // Subchunk1Size (PCM)
+  write_le_u16(f, 1);          // AudioFormat = PCM
+  write_le_u16(f, channels);
+  write_le_u32(f, sampleRate);
+  uint16_t blockAlign = channels * (bitsPerSample / 8);
+  uint32_t byteRate   = sampleRate * blockAlign;
+  write_le_u32(f, byteRate);
+  write_le_u16(f, blockAlign);
+  write_le_u16(f, bitsPerSample);
+
+  // data chunk
+  f.write((const uint8_t*)"data", 4);
+  write_le_u32(f, 0); // placeholder
+  return true;
+}
+
+// End WAV: patch sizes based on fileSize
+void wav_end_and_patch(File &f) {
+  if (!f) return;
+  uint32_t fileSize = f.size();
+  uint32_t dataSize = fileSize - 44;
+
+  // Patch data size at offset 40
+  f.seek(40);
+  write_le_u32(f, dataSize);
+
+  // Patch RIFF chunk size at offset 4 (fileSize - 8)
+  f.seek(4);
+  write_le_u32(f, fileSize - 8);
+
+  f.flush();
+  f.close();
+}
+
+// Called from RX paths: add decoded samples into 512-sample chunk buffer
+static void addSamplesToWavBuffer(const int16_t *samples, size_t count) {
+  if (!wavFile || recordingFinalized) return;
+
+  // Mark start of recording when first samples arrive
+  if (!recordingActive) {
+    recordingActive = true;
+    recordingStartMs = millis();
+  }
+
+  if (wavChunkReady) return;  // wait until current chunk is written
+
+  for (size_t i = 0; i < count; ++i) {
+    wavChunk[wavIndex++] = samples[i];
+    if (wavIndex >= WAV_SAMPLES_PER_CHUNK) {
+      wavIndex = 0;
+      wavChunkReady = true;
+      break;
+    }
+  }
+}
+
+// ====== WAV playback from /rx.wav to speaker ======
+void playWavFromSD() {
+  if (!SD.exists("/rx.wav")) {
+    Serial.println("No /rx.wav to play.");
+    return;
+  }
+
+  File f = SD.open("/rx.wav", FILE_READ);
+  if (!f) {
+    Serial.println("Failed to open /rx.wav for playback.");
+    return;
+  }
+
+  Serial.println("Playing /rx.wav...");
+
+  // skip 44-byte header
+  if (!f.seek(44)) {
+    Serial.println("Failed to seek past header.");
+    f.close();
+    return;
+  }
+
+  const size_t BUF_SAMPLES = 256;
+  int16_t pcm[BUF_SAMPLES];
+  int32_t outBuf[BUF_SAMPLES];
+
+  size_t bytesRead = 0;
+  do {
+    bytesRead = f.read((uint8_t*)pcm, BUF_SAMPLES * sizeof(int16_t));
+    if (bytesRead == 0) break;
+
+    size_t samples = bytesRead / sizeof(int16_t);
+    for (size_t i = 0; i < samples; ++i) {
+      outBuf[i] = ((int32_t)pcm[i]) << 16;
+    }
+
+    size_t written = 0;
+    i2s_write(I2S_PORT, outBuf, samples * sizeof(int32_t), &written, portMAX_DELAY);
+  } while (bytesRead > 0);
+
+  f.close();
+  Serial.println("Playback finished.");
+}
+
 // ====== Button ISR ======
 void IRAM_ATTR onButton() {
   unsigned long now = (unsigned long)(esp_timer_get_time() / 1000);
@@ -171,6 +317,9 @@ static void OnDataRecv(const uint8_t *mac_info, const uint8_t *data, int len) {
   int16_t decoded[PACKET_SAMPLES];
   for (int i = 0; i < PACKET_SAMPLES; ++i) decoded[i] = mulawToLinear(data[i]);
 
+  // push decoded samples into WAV buffer
+  addSamplesToWavBuffer(decoded, PACKET_SAMPLES);
+
   int32_t outBuf[PACKET_SAMPLES];
   for (int i = 0; i < PACKET_SAMPLES; ++i) outBuf[i] = ((int32_t)decoded[i]) << 16;
 
@@ -191,8 +340,28 @@ void setup() {
   digitalWrite(GREEN_LED, LOW);
   digitalWrite(YELLOW_LED, LOW);
 
+  pinMode(PLAY_BUTTON_PIN, INPUT_PULLDOWN);
+
   WiFi.mode(WIFI_STA);
   setupI2S();
+  SPI.begin(18, 19, 23, SD_CS); // spi init for SD module, might be redundant but doesn't matter
+
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD init failed; WAV recording disabled.");
+  } else {
+    if (SD.exists("/rx.wav")) SD.remove("/rx.wav");
+    wavFile = SD.open("/rx.wav", FILE_WRITE);
+    if (!wavFile) {
+      Serial.println("Failed to open /rx.wav for writing.");
+    } else {
+      if (!wav_begin(wavFile, SAMPLE_RATE, 16, 1)) {
+        Serial.println("Failed to write WAV header.");
+        wavFile.close();
+      } else {
+        Serial.println("WAV header written; will record incoming audio to /rx.wav");
+      }
+    }
+  }
 
   // ESP-NOW init
   setChannel(WIFI_CHANNEL);
@@ -218,6 +387,15 @@ void loop() {
     ignoreButton = false;
     digitalWrite(RED_LED, LOW);
     // Serial.println("RX idle — PTT re-enabled");
+  }
+
+  // No edge detection, just "if pressed, play" like you asked.
+  if (digitalRead(PLAY_BUTTON_PIN) == HIGH) {
+    // Optional: you might want to gate this so it only plays
+    // after recording is finalized, but for now just play.
+    playWavFromSD();
+    // crude debounce so holding the button doesn't retrigger instantly
+    delay(500);
   }
 
   // Handle PTT edge (press/release)
@@ -308,6 +486,9 @@ void loop() {
     int16_t decoded[32];
     for (int i = 0; i < 32; ++i) decoded[i] = mulawToLinear(encoded[i]);
 
+    // push RF decoded samples into WAV buffer
+    addSamplesToWavBuffer(decoded, 32);
+
     int32_t outBuf[32];
     for (int i = 0; i < 32; ++i) outBuf[i] = ((int32_t)decoded[i]) << 16;
 
@@ -317,5 +498,25 @@ void loop() {
     // UX: show RX LED briefly
     digitalWrite(RED_LED, HIGH);
     lastRecvMillis = millis();
+  }
+
+  // write full chunks to WAV file
+  if (wavChunkReady && wavFile && !recordingFinalized) {
+    size_t toWrite = WAV_SAMPLES_PER_CHUNK * sizeof(int16_t);
+    size_t w = wavFile.write((const uint8_t*)wavChunk, toWrite);
+    if (w != toWrite) {
+      Serial.println("Warning: short write to SD.");
+    }
+    wavChunkReady = false;
+    wavFile.flush();
+  }
+
+  // stop after RECORD_DURATION_MS and finalize header
+  if (recordingActive && !recordingFinalized &&
+      (millis() - recordingStartMs >= RECORD_DURATION_MS)) {
+    Serial.println("Finalizing WAV...");
+    wav_end_and_patch(wavFile);
+    recordingFinalized = true;
+    Serial.println("WAV finalized at /rx.wav");
   }
 }
