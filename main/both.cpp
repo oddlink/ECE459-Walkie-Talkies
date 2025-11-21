@@ -122,12 +122,12 @@ volatile bool wifiAcked = false; // becomes true when we get a 6-byte MAC ACK
 // receive-side UX lockout so PTT can’t interrupt in the middle of RX audio
 volatile bool ignoreButton = false;
 unsigned long lastRecvMillis = 0;
-const unsigned long RECEIVE_TIMEOUT_MS = 600;
+const unsigned long RECEIVE_TIMEOUT_MS = 100;
 
 // ====== Button ISR ======
 void IRAM_ATTR onButton() {
   if (ignoreButton) return;
-  unsigned long now = (unsigned long)(esp_timer_get_time() / 1000);
+  // unsigned long now = (unsigned long)(esp_timer_get_time() / 1000);
   // if (now - lastISRTime > debounceMs) {
     buttonEdge = true;      // edge detected, handle in loop()
   //   lastISRTime = now;
@@ -213,6 +213,10 @@ void setup() {
 }
 
 void loop() {
+  if(buttonEdge){
+    Serial.println(digitalRead(BUTTON_PIN));
+  }
+  
   // Re-enable button after RX idle
   if (ignoreButton && (millis() - lastRecvMillis > RECEIVE_TIMEOUT_MS)) {
     ignoreButton = false;
@@ -266,8 +270,8 @@ void loop() {
       digitalWrite(YELLOW_LED, LOW);
       esp_now_register_recv_cb(OnDataRecv);
       radio.startListening();
-      radio.flush_rx(); 
-      radio.flush_tx();
+      // radio.flush_rx(); 
+      // radio.flush_tx();
       Serial.println("RX mode");
     }
   }
