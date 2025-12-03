@@ -114,7 +114,7 @@ static bool radioSetup() {
 // ====== State ======
 volatile bool buttonEdge = false;
 volatile unsigned long lastISRTime = 0;
-const unsigned long debounceMs = 30;
+const unsigned long debounceMs = 100;
 
 bool sending = false;            // PTT state (true = talk)
 bool wifiSelected = false;       // true if Wi-Fi path selected
@@ -124,31 +124,18 @@ volatile bool wifiAcked = false; // becomes true when we get a 6-byte MAC ACK
 volatile bool ignoreButton = false;
 unsigned long lastRecvMillis = 0;
 const unsigned long RECEIVE_TIMEOUT_MS = 100;
-volatile bool pressedDuringIgnore = false;  // a press seen while ignoreButton was true
+volatile bool last_pressed_during_recv = false;
 
-
-// ====== Button ISR ======
 // ====== Button ISR ======
 void IRAM_ATTR onButton() {
-  if (ignoreButton) {
-    pressedDuringIgnore = !pressedDuringIgnore;
-    return;
-  }
+  if (ignoreButton) return;
   unsigned long now = (unsigned long)(esp_timer_get_time() / 1000);
   if (now - lastISRTime > debounceMs) {
-    if (!pressedDuringIgnore) {
-      buttonEdge = true;      // edge detected, handle in loop()
-      lastISRTime = now;
-    }
-    else {
-      pressedDuringIgnore = false;
-    }
-    
+    buttonEdge = true;      // edge detected, handle in loop()
+    lastISRTime = now;
   }
 
 }
-
-
 
 // ====== ESP-NOW callbacks ======
 static void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
@@ -228,19 +215,20 @@ void setup() {
 }
 
 void loop() {
-  // if(buttonEdge){
-  //   Serial.println(digitalRead(BUTTON_PIN));
-  // }
- 
+  if(buttonEdge){
+    Serial.println(digitalRead(BUTTON_PIN));
+  }
+  
   // Re-enable button after RX idle
   if (ignoreButton && (millis() - lastRecvMillis > RECEIVE_TIMEOUT_MS)) {
+    last_pressed_during_recv = true;
     ignoreButton = false;
     digitalWrite(RED_LED, LOW);
     // Serial.println("RX idle — PTT re-enabled");
   }
 
   // Handle PTT edge (press/release)
-  if (buttonEdge) {
+  if (buttonEdge && !last_pressed_during_recv) {
     buttonEdge = false;
     sending = !sending;
 
@@ -270,7 +258,7 @@ void loop() {
         digitalWrite(GREEN_LED, HIGH);
         digitalWrite(YELLOW_LED, LOW);
         Serial.println("Wi-Fi path ACKed → using ESP-NOW");
-      }
+      } 
       else if (buttonEdge){
         sending = false;  // Cancel TX attempt
         buttonEdge = false;
@@ -290,10 +278,14 @@ void loop() {
       esp_now_register_recv_cb(OnDataRecv);
       radio.startListening();
       delayMicroseconds(130);
-      // radio.flush_rx();
+      // radio.flush_rx(); 
       // radio.flush_tx();
       Serial.println("RX mode");
     }
+  }
+  else if (buttonEdge && last_pressed_during_recv) {
+    last_pressed_during_recv = false;
+    buttonEdge = false;
   }
 
   // ====== TX ======
@@ -319,7 +311,6 @@ void loop() {
       if (wifiSelected) {
         // Wi-Fi/ESP-NOW TX
         esp_now_send(BroadcastMac, encoded, PACKET_SAMPLES);
-        Serial.println("wifi sending");
         delay(2); // let things stabilize
       } else {
         // RF TX
