@@ -146,6 +146,7 @@ static void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
 // 12 bytes --> PING_STR --> reply with MAC (6 bytes) to acknowledge
 // 6 bytes --> MAC ACK --> wifiAcked=true (sender side)
 // 32 bytes --> μ-law audio --> decode to I2S (receiver side, if not currently sending)
+volatile int ack_count;
 static void OnDataRecv(const uint8_t *mac_info, const uint8_t *data, int len) {
   if (len == 12 && memcmp(data, PING_STR, 12) == 0) {
     // Got ping: reply with our STA MAC as 6-byte ACK
@@ -155,9 +156,12 @@ static void OnDataRecv(const uint8_t *mac_info, const uint8_t *data, int len) {
     return;
   }
 
-  if (len == 6) {
+  if (len == 6 && sending) {
     // Any well-formed 6-byte ACK marks Wi-Fi available
-    wifiAcked = true;
+    ack_count++;
+    if(ack_count == 2){
+      wifiAcked = true;
+    }
     return;
   }
 
@@ -168,8 +172,9 @@ static void OnDataRecv(const uint8_t *mac_info, const uint8_t *data, int len) {
   digitalWrite(RED_LED, HIGH);
   lastRecvMillis = millis();
 
-  if (sending) return;
-
+  if (sending){
+    return;
+  }
   int16_t decoded[PACKET_SAMPLES];
   for (int i = 0; i < PACKET_SAMPLES; ++i) decoded[i] = mulawToLinear(data[i]);
 
@@ -252,8 +257,9 @@ void loop() {
           delay(10);
         }
       }
-
+  
       if (wifiAcked && !buttonEdge) {
+        ack_count = 0;
         wifiSelected = true;
         digitalWrite(GREEN_LED, HIGH);
         digitalWrite(YELLOW_LED, LOW);
@@ -323,6 +329,7 @@ void loop() {
 
   // ====== RX (RF side) ======
   if (!sending && radio.available()) {
+    ignoreButton = true;
     uint8_t encoded[32];
     radio.read(encoded, sizeof(encoded));
 
