@@ -114,7 +114,7 @@ static bool radioSetup() {
 // ====== State ======
 volatile bool buttonEdge = false;
 volatile unsigned long lastISRTime = 0;
-const unsigned long debounceMs = 100;
+const unsigned long debounceMs = 300;
 
 bool sending = false;            // PTT state (true = talk)
 bool wifiSelected = false;       // true if Wi-Fi path selected
@@ -123,7 +123,7 @@ volatile bool wifiAcked = false; // becomes true when we get a 6-byte MAC ACK
 // receive-side UX lockout so PTT can’t interrupt in the middle of RX audio
 volatile bool ignoreButton = false;
 unsigned long lastRecvMillis = 0;
-const unsigned long RECEIVE_TIMEOUT_MS = 100;
+const unsigned long RECEIVE_TIMEOUT_MS = 50;
 volatile bool last_pressed_during_recv = false;
 
 // ====== Button ISR ======
@@ -226,10 +226,13 @@ void loop() {
   
   // Re-enable button after RX idle
   if (ignoreButton && (millis() - lastRecvMillis > RECEIVE_TIMEOUT_MS)) {
-    last_pressed_during_recv = true;
+    // last_pressed_during_recv = true;
     ignoreButton = false;
     digitalWrite(RED_LED, LOW);
     // Serial.println("RX idle — PTT re-enabled");
+  }
+  else if(ignoreButton && buttonEdge){
+    last_pressed_during_recv = true;
   }
 
   // Handle PTT edge (press/release)
@@ -290,6 +293,7 @@ void loop() {
     }
   }
   else if (buttonEdge && last_pressed_during_recv) {
+    Serial.println("here");
     last_pressed_during_recv = false;
     buttonEdge = false;
   }
