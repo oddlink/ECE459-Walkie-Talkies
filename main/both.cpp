@@ -114,7 +114,7 @@ static bool radioSetup() {
 // ====== State ======
 volatile bool buttonEdge = false;
 volatile unsigned long lastISRTime = 0;
-const unsigned long debounceMs = 300;
+const unsigned long debounceMs = 30;
 
 bool sending = false;            // PTT state (true = talk)
 bool wifiSelected = false;       // true if Wi-Fi path selected
